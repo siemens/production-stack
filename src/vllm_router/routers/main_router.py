@@ -69,6 +69,11 @@ async def route_completion(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/completions", background_tasks)
 
 
+@main_router.post("/v1/fim/completions")
+async def route_completion_mistral_fim(request: Request, background_tasks: BackgroundTasks):
+    return await route_general_request(request, "/v1/fim/completions", background_tasks)
+
+
 @main_router.post("/v1/embeddings")
 async def route_embeddings(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/embeddings", background_tasks)
