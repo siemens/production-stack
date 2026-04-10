@@ -164,7 +164,10 @@ def parse_args():
         "--static-aliases",
         type=str,
         default=None,
-        help="The aliases of static backends, separated by commas. E.g., your-custom-model:llama3",
+        help="The aliases of static backends, separated by commas. "
+        "Simple: your-custom-model:llama3. "
+        "With reasoning effort: reasoning:qwen-3.5-27b|reasoning_effort=high. "
+        "Valid reasoning_effort values: none, low, medium, high",
     )
     parser.add_argument(
         "--static-model-types",
@@ -184,6 +187,13 @@ def parse_args():
         default=None,
         help="Disable healthcheck per backend, separated by commas. E.g., true,false,true. "
         "When set, backends with 'true' will be excluded from periodic health checks.",
+    )
+    parser.add_argument(
+        "--static-endpoint-prefixes",
+        type=str,
+        default=None,
+        help="JSON-encoded list of endpoint prefix dicts per backend. "
+        'E.g., \'[{"anthropic": "/anthropic"}, {}]\'',
     )
     parser.add_argument(
         "--static-backend-health-checks",

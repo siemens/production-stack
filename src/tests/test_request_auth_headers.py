@@ -16,6 +16,7 @@ class EndpointInfo:
         self.url = url
         self.model_names = model_names or ["whisper-model"]
         self.sleep = sleep
+        self.endpoint_prefixes = None
 
 
 @pytest.fixture(autouse=True)

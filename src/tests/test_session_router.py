@@ -8,6 +8,7 @@ from vllm_router.routers.routing_logic import SessionRouter
 class EndpointInfo:
     def __init__(self, url: str):
         self.url = url
+        self.endpoint_prefixes = None
 
 
 class RequestStats:

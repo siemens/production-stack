@@ -17,6 +17,7 @@ def cleanup_router():
 class EndpointInfo:
     def __init__(self, url: str):
         self.url = url
+        self.endpoint_prefixes = None
 
 
 class RequestStats:

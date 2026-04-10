@@ -28,6 +28,7 @@ from kubernetes import client, config, watch
 
 from vllm_router import utils
 from vllm_router.log import init_logger
+from vllm_router.utils import AliasConfig, normalize_alias_config
 
 logger = init_logger(__name__)
 
@@ -107,6 +108,7 @@ class EndpointInfo:
     service_name: Optional[str] = None
     namespace: Optional[str] = None
     model_info: Dict[str, ModelInfo] = None
+    endpoint_prefixes: Dict[str, str] = None
 
     def __str__(self):
         return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace})"
@@ -224,7 +226,7 @@ class StaticServiceDiscovery(ServiceDiscovery):
         app,
         urls: List[str],
         models: List[str],
-        aliases: List[str] | None = None,
+        aliases: dict[str, str | AliasConfig] | None = None,
         model_labels: List[str] | None = None,
         model_types: List[str] | None = None,
         healthcheck_disabled: List[str] | None = None,
@@ -233,15 +235,24 @@ class StaticServiceDiscovery(ServiceDiscovery):
         static_backend_health_check_timeout_seconds: int = 10,
         prefill_model_labels: List[str] | None = None,
         decode_model_labels: List[str] | None = None,
+        endpoint_prefixes: List[Dict[str, str]] | None = None,
     ):
         self.app = app
         assert len(urls) == len(models), "URLs and models should have the same length"
         self.urls = urls
         self.models = models
-        self.aliases = aliases
+        self.aliases = (
+            {
+                alias: normalize_alias_config(alias, value)
+                for alias, value in aliases.items()
+            }
+            if aliases is not None
+            else None
+        )
         self.model_labels = model_labels
         self.model_types = model_types
         self.healthcheck_disabled = healthcheck_disabled
+        self.endpoint_prefixes = endpoint_prefixes
         self.engines_id = [str(uuid.uuid4()) for i in range(0, len(urls))]
         self.added_timestamp = int(time.time())
         self.unhealthy_endpoint_hashes = []
@@ -343,6 +354,11 @@ class StaticServiceDiscovery(ServiceDiscovery):
             ):
                 continue
             model_label = self.model_labels[i] if self.model_labels else "default"
+            ep_prefixes = (
+                self.endpoint_prefixes[i]
+                if self.endpoint_prefixes and i < len(self.endpoint_prefixes)
+                else None
+            )
             endpoint_info = EndpointInfo(
                 url=url,
                 model_names=[model],  # Convert single model to list
@@ -351,6 +367,7 @@ class StaticServiceDiscovery(ServiceDiscovery):
                 added_timestamp=self.added_timestamp,
                 model_label=model_label,
                 model_info=self._get_model_info(model),
+                endpoint_prefixes=ep_prefixes if ep_prefixes else None,
             )
             endpoint_infos.append(endpoint_info)
         return endpoint_infos

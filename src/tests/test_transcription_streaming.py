@@ -24,6 +24,7 @@ class EndpointInfo:
         self.model_names = model_names or ["whisper-model"]
         self.sleep = sleep
         self.Id = Id
+        self.endpoint_prefixes = None
 
 
 ENDPOINTS = [EndpointInfo(url="http://whisper-engine")]

@@ -17,6 +17,7 @@ class EndpointInfo:
         self.model_names = model_names or ["test-model"]
         self.sleep = sleep
         self.Id = Id
+        self.endpoint_prefixes = None
 
 
 @pytest.fixture(autouse=True)
