@@ -23,6 +23,7 @@ class EndpointInfo:
         self.model_names = model_names or ["tts-model"]
         self.sleep = sleep
         self.Id = Id
+        self.endpoint_prefixes = None
 
 
 def _make_mock_headers(content_type: str):

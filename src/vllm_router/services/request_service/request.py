@@ -37,6 +37,7 @@ from vllm_router.services.request_service.rewriter import (
     is_request_rewriter_initialized,
 )
 from vllm_router.utils import (
+    normalize_alias_config,
     replace_model_in_request_body,
     update_content_length,
 )
@@ -93,6 +94,11 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
     "content-encoding",
     "transfer-encoding",
     "connection",
+}
+
+_ENDPOINT_SCHEMA_TYPE: dict[str, str] = {
+    "/v1/messages": "anthropic",
+    "/v1/responses": "responses",
 }
 
 
@@ -477,8 +483,15 @@ async def route_general_request(
     endpoints = service_discovery.get_endpoint_info()
 
     aliases = getattr(service_discovery, "aliases", None)
-    if aliases and requested_model in aliases.keys():
-        requested_model = aliases[requested_model]
+    if aliases and requested_model in aliases:
+        alias_config = normalize_alias_config(requested_model, aliases[requested_model])
+        requested_model = alias_config.model
+        if alias_config.reasoning_effort and "reasoning_effort" not in request_json:
+            request_json["reasoning_effort"] = alias_config.reasoning_effort
+        if alias_config.reasoning_effort == "none":
+            request_json.setdefault("chat_template_kwargs", {})[
+                "enable_thinking"
+            ] = False
         request_body = replace_model_in_request_body(request_json, requested_model)
         update_content_length(request, request_body)
 
@@ -585,6 +598,13 @@ async def route_general_request(
     error_urls = set()
     last_error = None
     max_attempts = request.app.state.router.max_instance_failover_reroute_attempts + 1
+
+    schema_type = _ENDPOINT_SCHEMA_TYPE.get(endpoint)
+    if schema_type:
+        selected_ep = next((ep for ep in endpoints if ep.url == server_url), None)
+        if selected_ep and selected_ep.endpoint_prefixes:
+            prefix = selected_ep.endpoint_prefixes.get(schema_type, "")
+            endpoint = prefix + endpoint
 
     for attempt in range(max_attempts):
         if attempt > 0:
