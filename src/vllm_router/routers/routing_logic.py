@@ -112,15 +112,16 @@ class RoutingInterface(metaclass=SingletonABCMeta):
         if session_key is None:
             return None
         val = request.headers.get(session_key)
-        return val if val is not None else request_json.get(session_key, None)
+        return val if val is not None else (request_json or {}).get(session_key, None)
 
     @abc.abstractmethod
-    def route_request(
+    async def route_request(
         self,
         endpoints: List[EndpointInfo],
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         Route the request to the appropriate engine URL
@@ -165,12 +166,13 @@ class RoundRobinRouter(RoutingInterface):
             self._sorted_cache[urls] = key
         return key
 
-    def route_request(
+    async def route_request(
         self,
         endpoints: List[EndpointInfo],
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         Route the request to the appropriate engine URL using a simple
@@ -216,7 +218,7 @@ class SessionRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-        request_json: Dict,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         Route the request to the appropriate engine URL by the 'session id' in
@@ -335,7 +337,7 @@ class KvawareRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-        request_json: Dict,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         Route the request to the appropriate engine URL by where the KV cache
@@ -361,14 +363,14 @@ class KvawareRouter(RoutingInterface):
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     endpoints[0].model_names[0]
                 )
-            token_ids = self.tokenizer.encode(request_json.get("prompt", ""))
+            token_ids = self.tokenizer.encode((request_json or {}).get("prompt", ""))
         except Exception:
             # Remote /tokenize fallback (let errors bubble up to keep behavior simple)
             remote_url = endpoints[0].url + "/tokenize"
             headers = {"Content-Type": "application/json"}
             data = {
                 "model": endpoints[0].model_names[0],
-                "prompt": request_json.get("prompt", ""),
+                "prompt": (request_json or {}).get("prompt", ""),
             }
             body = requests.post(
                 remote_url, headers=headers, json=data, timeout=10
@@ -450,7 +452,7 @@ class PrefixAwareRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-        request_json: Dict,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         Route the request to the appropriate engine URL by where the longest
@@ -470,9 +472,10 @@ class PrefixAwareRouter(RoutingInterface):
         """
 
         # Handle chat completions
-        if "messages" in request_json:
+        _request_json = request_json or {}
+        if "messages" in _request_json:
             # Get the last message from the messages array
-            messages = request_json["messages"]
+            messages = _request_json["messages"]
             if messages:
                 # Concatenate all message content
                 prompt_parts = []
@@ -493,7 +496,7 @@ class PrefixAwareRouter(RoutingInterface):
                 prompt = ""
         else:
             # Handle regular completions
-            prompt = request_json["prompt"]
+            prompt = _request_json["prompt"]
 
         available_endpoints = set(endpoint.url for endpoint in endpoints)
         _, matched_endpoint = await self.hashtrie.longest_prefix_match(
@@ -518,20 +521,20 @@ class DisaggregatedPrefillRouter(RoutingInterface):
         self.decode_model_labels = decode_model_labels
         self.request_cache = {}  # Cache to store prefill results
 
-    def route_request(
+    async def route_request(
         self,
         endpoints: List[EndpointInfo],
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-        request_json: Dict,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         Route the request to appropriate endpoints for prefill and decode operations.
         First request goes to prefill endpoint, then second request goes to decode endpoint.
         """
         # Find prefill and decode endpoints
-        is_prefill = request_json.get("max_tokens", 0) == 1
+        is_prefill = (request_json or {}).get("max_tokens", 0) == 1
         if is_prefill:
             logger.info("Prefill request")
         else:
@@ -646,7 +649,7 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-        request_json: Dict,
+        request_json: Optional[Dict] = None,
     ) -> str:
         """
         This method is called by the router framework but for orchestrated routing,
