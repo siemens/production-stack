@@ -263,6 +263,7 @@ class StaticServiceDiscovery(ServiceDiscovery):
             self.start_health_check_task()
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
+        self.endpoint_prefixes = endpoint_prefixes
 
     def get_unhealthy_endpoint_hashes(self) -> list[str]:
         unhealthy_endpoints = []
@@ -367,7 +368,7 @@ class StaticServiceDiscovery(ServiceDiscovery):
                 added_timestamp=self.added_timestamp,
                 model_label=model_label,
                 model_info=self._get_model_info(model),
-                endpoint_prefixes=ep_prefixes if ep_prefixes else None,
+                endpoint_prefixes=ep_prefixes or None,
             )
             endpoint_infos.append(endpoint_info)
         return endpoint_infos
