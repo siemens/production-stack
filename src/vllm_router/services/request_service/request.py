@@ -97,8 +97,20 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
 }
 
 _ENDPOINT_SCHEMA_TYPE: dict[str, str] = {
-    "/v1/messages": "anthropic",
+    "/v1/chat/completions": "openai",
+    "/v1/completions": "openai",
+    "/v1/embeddings": "openai",
     "/v1/responses": "responses",
+    "/v1/audio/speech": "openai",
+    "/v1/audio/transcriptions": "openai",
+    "/v1/audio/translations": "openai",
+    "/v1/audio/voices": "openai",
+    "/v1/images/generations": "openai",
+    "/v1/images/edits": "openai",
+    "/v1/models": "openai",
+    "/v1/messages": "anthropic",
+    "/v1/rerank": "cohere",
+    "/v2/rerank": "cohere",
 }
 
 
@@ -620,6 +632,14 @@ async def route_general_request(
         span.set_attribute(
             "vllm.routing_logic", type(request.app.state.router).__name__
         )
+
+    # Apply endpoint prefix based on schema type (e.g., anthropic -> /anthropic)
+    schema_type = _ENDPOINT_SCHEMA_TYPE.get(endpoint)
+    if schema_type:
+        selected_ep = next((ep for ep in endpoints if ep.url == server_url), None)
+        if selected_ep and selected_ep.endpoint_prefixes:
+            prefix = selected_ep.endpoint_prefixes.get(schema_type, "")
+            endpoint = prefix + endpoint
 
     error_urls = set()
     last_error = None
