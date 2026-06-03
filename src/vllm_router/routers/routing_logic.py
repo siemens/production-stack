@@ -575,19 +575,35 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
     Load balancing: Uses round-robin across available prefill and decode pods.
     """
 
-    def __init__(self, prefill_model_labels: List[str], decode_model_labels: List[str]):
+    def __init__(
+        self,
+        prefill_model_labels: List[str],
+        decode_model_labels: List[str],
+        fallback_routing_logic: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ):
         if hasattr(self, "_initialized"):
             return
         self.prefill_model_labels = prefill_model_labels or []
         self.decode_model_labels = decode_model_labels or []
-        # Round-robin counters for load balancing across xPyD pods
         self.prefill_idx = 0
         self.decode_idx = 0
+
+        if fallback_routing_logic == "session":
+            self._fallback_router: RoutingInterface = SessionRouter(session_key)
+        elif fallback_routing_logic == "roundrobin":
+            self._fallback_router = RoundRobinRouter()
+        elif session_key:
+            self._fallback_router = SessionRouter(session_key)
+        else:
+            self._fallback_router = RoundRobinRouter()
+
         self._initialized = True
         logger.info(
             f"Initialized DisaggregatedPrefillOrchestratedRouter with "
             f"prefill_labels={self.prefill_model_labels}, "
-            f"decode_labels={self.decode_model_labels}"
+            f"decode_labels={self.decode_model_labels}, "
+            f"fallback={type(self._fallback_router).__name__}"
         )
 
     def _find_endpoints(self, endpoints: List[EndpointInfo]):
@@ -659,13 +675,15 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         request_json: Optional[Dict] = None,
     ) -> str:
         """
-        This method is called by the router framework but for orchestrated routing,
-        we need to handle the full flow differently. This returns the prefill URL
-        as a placeholder - the actual orchestration happens in route_orchestrated_disaggregated_request.
+        Fallback routing for models without prefill/decode endpoints.
+        Delegates to the configured fallback router (session or roundrobin).
+        P/D models are handled in route_orchestrated_disaggregated_request.
         """
-        prefiller_endpoints, _ = self._find_endpoints(endpoints)
-        # Return prefill URL - actual orchestration is done in request.py
-        return prefiller_endpoints[0].url
+        if not endpoints:
+            raise ValueError("No endpoints available")
+        return await self._fallback_router.route_request(
+            endpoints, engine_stats, request_stats, request, request_json
+        )
 
 
 # Instead of managing a global _global_router, we can define the initialization functions as:
@@ -705,7 +723,10 @@ def initialize_routing_logic(
     elif routing_logic == RoutingLogic.DISAGGREGATED_PREFILL_ORCHESTRATED:
         logger.info("Initializing disaggregated prefill orchestrated routing logic")
         return DisaggregatedPrefillOrchestratedRouter(
-            kwargs.get("prefill_model_labels"), kwargs.get("decode_model_labels")
+            kwargs.get("prefill_model_labels"),
+            kwargs.get("decode_model_labels"),
+            fallback_routing_logic=kwargs.get("fallback_routing_logic"),
+            session_key=kwargs.get("session_key"),
         )
     else:
         raise ValueError(f"Invalid routing logic {routing_logic}")

@@ -401,23 +401,50 @@ async def route_general_request(
     Returns:
         StreamingResponse: A response object that streams data from the backend server to the client.
     """
+    # Read body once upfront; Starlette caches it for subsequent reads
+    request_body = await request.body()
+    request_json = json.loads(request_body) if request_body else {}
+
     if isinstance(request.app.state.router, DisaggregatedPrefillRouter):
         response = await route_disaggregated_prefill_request(
             request, endpoint, background_tasks
         )
         return response
 
-    # Handle orchestrated disaggregated inference (NxDI pattern)
+    # Orchestrated disaggregated inference — only for models that have
+    # both prefill-labeled and decode-labeled endpoints configured.
+    # Models without P/D endpoints use standard routing regardless of
+    # the router type (config-driven, no model names in code).
     if isinstance(request.app.state.router, DisaggregatedPrefillOrchestratedRouter):
-        response = await route_orchestrated_disaggregated_request(
-            request, endpoint, background_tasks
+        router = request.app.state.router
+        service_discovery = get_service_discovery()
+        all_eps = service_discovery.get_endpoint_info()
+        requested_model = (request_json or {}).get("model", "")
+        aliases = getattr(service_discovery, "aliases", None)
+        if aliases and requested_model in aliases:
+            alias_config = normalize_alias_config(
+                requested_model, aliases[requested_model]
+            )
+            requested_model = alias_config.model
+        model_eps = [
+            e for e in all_eps
+            if requested_model in e.model_names and not e.sleep
+        ]
+        has_prefill = any(
+            e.model_label in router.prefill_model_labels for e in model_eps
         )
-        return response
+        has_decode = any(
+            e.model_label in router.decode_model_labels for e in model_eps
+        )
+        if has_prefill and has_decode:
+            response = await route_orchestrated_disaggregated_request(
+                request, endpoint, background_tasks
+            )
+            return response
+
     in_router_time = time.time()
     # Same as vllm, Get request_id from X-Request-Id header if available
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-    request_body = await request.body()
-    request_json = json.loads(request_body) if request_body else {}
 
     # OpenTelemetry tracing: extract incoming context and create parent span
     span, span_context = None, None

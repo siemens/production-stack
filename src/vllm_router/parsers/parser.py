@@ -444,6 +444,14 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--fallback-routing-logic",
+        type=str,
+        choices=["roundrobin", "session"],
+        default=None,
+        help="Routing logic for models without prefill/decode endpoints (only used with disaggregated_prefill_orchestrated).",
+    )
+
+    parser.add_argument(
         "--prefill-model-labels",
         type=str,
         default=None,

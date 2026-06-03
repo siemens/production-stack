@@ -292,6 +292,7 @@ def initialize_all(app: FastAPI, args):
         max_instance_failover_reroute_attempts=args.max_instance_failover_reroute_attempts,
         lmcache_health_check_interval=args.lmcache_health_check_interval,
         lmcache_worker_timeout=args.lmcache_worker_timeout,
+        fallback_routing_logic=args.fallback_routing_logic,
     )
 
     # Initialize feature gates
