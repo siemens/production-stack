@@ -70,6 +70,7 @@ class DynamicRouterConfig:
 
     # Routing logic configurations
     session_key: Optional[str] = None
+    fallback_routing_logic: Optional[str] = None
 
     # Logging Options
     callbacks: Optional[str] = None
@@ -109,6 +110,7 @@ class DynamicRouterConfig:
             # Routing logic configurations
             routing_logic=args.routing_logic,
             session_key=args.session_key,
+            fallback_routing_logic=args.fallback_routing_logic,
             # Logging Options
             callbacks=args.callbacks,
         )
@@ -224,7 +226,9 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         Reconfigures the router with the given config.
         """
         routing_logic = reconfigure_routing_logic(
-            config.routing_logic, session_key=config.session_key
+            config.routing_logic,
+            session_key=config.session_key,
+            fallback_routing_logic=config.fallback_routing_logic,
         )
         self.app.state.router = routing_logic
         logger.info("DynamicConfigWatcher: Routing logic reconfiguration complete")
