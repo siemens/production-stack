@@ -196,9 +196,11 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
                 decode_model_labels=parse_comma_separated_args(
                     config.decode_model_labels
                 ),
-                endpoint_prefixes=json.loads(config.static_endpoint_prefixes)
-                if config.static_endpoint_prefixes
-                else None,
+                endpoint_prefixes=(
+                    json.loads(config.static_endpoint_prefixes)
+                    if config.static_endpoint_prefixes
+                    else None
+                ),
             )
         elif config.service_discovery == "k8s":
             reconfigure_service_discovery(

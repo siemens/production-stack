@@ -227,9 +227,11 @@ def initialize_all(app: FastAPI, args):
             static_backend_health_check_timeout_seconds=args.static_backend_health_check_timeout_seconds,
             prefill_model_labels=args.prefill_model_labels,
             decode_model_labels=args.decode_model_labels,
-            endpoint_prefixes=json.loads(args.static_endpoint_prefixes)
-            if args.static_endpoint_prefixes
-            else None,
+            endpoint_prefixes=(
+                json.loads(args.static_endpoint_prefixes)
+                if args.static_endpoint_prefixes
+                else None
+            ),
         )
     elif args.service_discovery == "k8s":
         initialize_service_discovery(

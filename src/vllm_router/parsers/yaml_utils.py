@@ -111,7 +111,9 @@ def read_and_process_yaml_config_file(config_path: str) -> dict[str, Any]:
             if models:
                 yaml_config["static_backends"] = generate_static_backends(models)
                 yaml_config["static_models"] = generate_static_models(models)
-                yaml_config["static_model_labels"] = generate_static_model_labels(models)
+                yaml_config["static_model_labels"] = generate_static_model_labels(
+                    models
+                )
                 yaml_config["static_model_types"] = generate_static_model_types(models)
                 yaml_config["static_healthcheck_disabled"] = (
                     generate_static_healthcheck_disabled(models)

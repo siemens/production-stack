@@ -427,15 +427,12 @@ async def route_general_request(
             )
             requested_model = alias_config.model
         model_eps = [
-            e for e in all_eps
-            if requested_model in e.model_names and not e.sleep
+            e for e in all_eps if requested_model in e.model_names and not e.sleep
         ]
         has_prefill = any(
             e.model_label in router.prefill_model_labels for e in model_eps
         )
-        has_decode = any(
-            e.model_label in router.decode_model_labels for e in model_eps
-        )
+        has_decode = any(e.model_label in router.decode_model_labels for e in model_eps)
         if has_prefill and has_decode:
             response = await route_orchestrated_disaggregated_request(
                 request, endpoint, background_tasks
