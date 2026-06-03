@@ -73,11 +73,11 @@ class NoopRequestRewriter(RequestRewriter):
 
 class MessagesRewriter(RequestRewriter):
     """
-    A request rewriter for Anthropic Messages API and OpenAI Chat Completions API
-    requests that normalizes messages before forwarding to the backend.
+    A request rewriter that normalizes messages before forwarding.
 
     Normalizations:
     - Filters out messages with empty/null content (some backends reject them).
+      Assistant messages with ``tool_calls`` are preserved even with null content.
     - For ``/v1/messages``, promotes ``role: "system"`` entries in the messages
       array to the top-level ``system`` parameter (handles the ``mid-conversation-system``
       beta format sent by e.g. Claude Code).
@@ -94,6 +94,7 @@ class MessagesRewriter(RequestRewriter):
             return request_body
 
         # Guard: skip messages with empty content (some backends reject them).
+        # Preserve assistant messages with tool_calls even when content is null/empty.
         messages = [m for m in messages if _message_has_content(m)]
 
         if not messages:
@@ -134,6 +135,10 @@ class MessagesRewriter(RequestRewriter):
 
 
 def _message_has_content(message: dict) -> bool:
+    # Assistant messages with tool_calls, function_call, or refusal are valid
+    # even with null/empty content.
+    if message.get("tool_calls") or message.get("function_call") or message.get("refusal"):
+        return True
     content = message.get("content")
     if content is None:
         return False
