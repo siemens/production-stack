@@ -192,7 +192,8 @@ def parse_args():
         "--static-endpoint-prefixes",
         type=str,
         default=None,
-        help="JSON-encoded list of endpoint prefix dicts per backend. "
+        help="JSON array of endpoint prefix mappings per backend. "
+        "Each element is a dict mapping schema types to path prefixes. "
         'E.g., \'[{"anthropic": "/anthropic"}, {}]\'',
     )
     parser.add_argument(

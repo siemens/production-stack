@@ -58,6 +58,7 @@ class DynamicRouterConfig:
     static_model_labels: Optional[str] = None
     static_model_types: Optional[str] = None
     static_healthcheck_disabled: Optional[str] = None
+    static_endpoint_prefixes: Optional[str] = None
     static_backend_health_checks: Optional[bool] = False
     static_backend_health_check_interval: Optional[int] = 60
     static_backend_health_check_timeout_seconds: Optional[int] = 10
@@ -196,9 +197,11 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
                 decode_model_labels=parse_comma_separated_args(
                     config.decode_model_labels
                 ),
-                endpoint_prefixes=json.loads(config.static_endpoint_prefixes)
-                if config.static_endpoint_prefixes
-                else None,
+                endpoint_prefixes=(
+                    json.loads(config.static_endpoint_prefixes)
+                    if config.static_endpoint_prefixes
+                    else None
+                ),
             )
         elif config.service_discovery == "k8s":
             reconfigure_service_discovery(
