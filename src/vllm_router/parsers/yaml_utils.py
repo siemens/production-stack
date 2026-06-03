@@ -21,7 +21,8 @@ def generate_static_models(models: dict[str, Any]) -> str:
     static_models = []
     for name, details in models.items():
         if "static_backends" in details:
-            static_models.extend([name] * len(details["static_backends"]))
+            model_name = details.get("model_name", name)
+            static_models.extend([model_name] * len(details["static_backends"]))
     return ",".join(static_models)
 
 
@@ -60,6 +61,15 @@ def generate_static_aliases(aliases: dict[str, Any]) -> str:
             entry += f"|reasoning_effort={config.reasoning_effort}"
         parts.append(entry)
     return ",".join(parts)
+
+
+def generate_static_model_labels(models: dict[str, Any]) -> str:
+    static_model_labels = []
+    for _, details in models.items():
+        if "static_backends" in details:
+            label = details.get("model_label", "default")
+            static_model_labels.extend([label] * len(details["static_backends"]))
+    return ",".join(static_model_labels)
 
 
 def generate_static_model_types(models: dict[str, Any]) -> str:
@@ -101,6 +111,7 @@ def read_and_process_yaml_config_file(config_path: str) -> dict[str, Any]:
             if models:
                 yaml_config["static_backends"] = generate_static_backends(models)
                 yaml_config["static_models"] = generate_static_models(models)
+                yaml_config["static_model_labels"] = generate_static_model_labels(models)
                 yaml_config["static_model_types"] = generate_static_model_types(models)
                 yaml_config["static_healthcheck_disabled"] = (
                     generate_static_healthcheck_disabled(models)
