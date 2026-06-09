@@ -62,6 +62,7 @@ class DynamicRouterConfig:
     static_backend_health_check_interval: Optional[int] = 60
     static_backend_health_check_timeout_seconds: Optional[int] = 10
     static_endpoint_prefixes: Optional[str] = None
+    tokenizer_model_names: Optional[str] = None
     prefill_model_labels: Optional[str] = None
     decode_model_labels: Optional[str] = None
     k8s_port: Optional[int] = None
@@ -104,6 +105,7 @@ class DynamicRouterConfig:
                 args, "static_healthcheck_disabled", None
             ),
             static_endpoint_prefixes=getattr(args, "static_endpoint_prefixes", None),
+            tokenizer_model_names=getattr(args, "tokenizer_model_names", None),
             k8s_port=args.k8s_port,
             k8s_namespace=args.k8s_namespace,
             k8s_label_selector=args.k8s_label_selector,
@@ -231,6 +233,11 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
             config.routing_logic,
             session_key=config.session_key,
             fallback_routing_logic=config.fallback_routing_logic,
+            tokenizer_model_names=(
+                json.loads(config.tokenizer_model_names)
+                if config.tokenizer_model_names
+                else None
+            ),
         )
         self.app.state.router = routing_logic
         logger.info("DynamicConfigWatcher: Routing logic reconfiguration complete")

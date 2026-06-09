@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import asyncio
-from typing import Generator, Set, Tuple
+from typing import Generator, Optional, Set, Tuple
 
 import xxhash
 
@@ -43,18 +43,15 @@ class HashTrie:
         self.root = TrieNode()
         self.chunk_size = chunk_size
 
-    def _chunk_and_hash(self, request: str) -> Generator[int, None, None]:
+    def _chunk_and_hash(self, request: str) -> Generator[Tuple[int, int], None, None]:
         """
-        Chunk and hash the request.
-        Args:
-            request (str): The request to chunk and hash.
-        Returns:
-            Generator[int, None, None]: A generator that yields a hash for each
-            chunk.
+        Yield per-character (hash, 1) chunks. This produces one trie node
+        per character, enabling correct longest-prefix-match on variable-length
+        chat/message payloads.
         """
 
-        for i in range(0, len(request), self.chunk_size):
-            yield xxhash.xxh64(request[i : i + self.chunk_size]).intdigest()
+        for char in request:
+            yield xxhash.xxh64(char.encode("utf-8")).intdigest(), 1
 
     async def insert(self, request: str, endpoint: str) -> None:
         """
@@ -66,7 +63,7 @@ class HashTrie:
         node = self.root
         async with node.lock:
             node.endpoints.add(endpoint)
-        for chunk_hash in self._chunk_and_hash(request):
+        for chunk_hash, _ in self._chunk_and_hash(request):
             async with node.lock:
                 if chunk_hash not in node.children:
                     node.children[chunk_hash] = TrieNode()
@@ -75,19 +72,25 @@ class HashTrie:
                 node.endpoints.add(endpoint)
 
     async def longest_prefix_match(
-        self, request: str, available_endpoints: Set[str] = set()
+        self,
+        request: str,
+        available_endpoints: Optional[Set[str]] = None,
     ) -> Tuple[int, Set[str]]:
         """
         Find the longest matching prefix using hashed chunks.
         Args:
             request (str): The request to find the longest matching prefix.
-            available_endpoints (Set[str]): The endpoints that are available.
+            available_endpoints (Optional[Set[str]]): The endpoints that are
+                available. If None, no endpoints are considered and the match
+                will always return an empty set.
         """
         node = self.root
         match_length = 0
-        selected_endpoints = available_endpoints
+        selected_endpoints = (
+            available_endpoints.copy() if available_endpoints is not None else set()
+        )
 
-        for chunk_hash in self._chunk_and_hash(request):
+        for chunk_hash, chunk_len in self._chunk_and_hash(request):
             async with node.lock:
                 node = node.children.get(chunk_hash)
             if not node:
@@ -98,7 +101,7 @@ class HashTrie:
             # reached longest prefix match in currently-available endpoints.
             if not intersection:
                 break
-            match_length += self.chunk_size
+            match_length += chunk_len
             selected_endpoints = intersection
 
         return match_length, selected_endpoints

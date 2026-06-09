@@ -137,7 +137,11 @@ class MessagesRewriter(RequestRewriter):
 def _message_has_content(message: dict) -> bool:
     # Assistant messages with tool_calls, function_call, or refusal are valid
     # even with null/empty content.
-    if message.get("tool_calls") or message.get("function_call") or message.get("refusal"):
+    if (
+        message.get("tool_calls")
+        or message.get("function_call")
+        or message.get("refusal")
+    ):
         return True
     content = message.get("content")
     if content is None:
