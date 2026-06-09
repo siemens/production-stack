@@ -30,6 +30,7 @@ from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
     DisaggregatedPrefillOrchestratedRouter,
     DisaggregatedPrefillRouter,
+    PrefixAwareRouter,
 )
 from vllm_router.service_discovery import get_service_discovery
 from vllm_router.services.request_service.rewriter import (
@@ -551,9 +552,11 @@ async def route_general_request(
     else:
         endpoints = list(
             filter(
-                lambda x: requested_model in x.model_names
-                and x.Id == request_endpoint
-                and not x.sleep,
+                lambda x: (
+                    requested_model in x.model_names
+                    and x.Id == request_endpoint
+                    and not x.sleep
+                ),
                 endpoints,
             )
         )
@@ -621,6 +624,10 @@ async def route_general_request(
 
     error_urls = set()
     last_error = None
+    stream_generator = None
+    status = None
+    headers_dict = {}
+    media_type = "text/event-stream"
     max_attempts = request.app.state.router.max_instance_failover_reroute_attempts + 1
 
     schema_type = _ENDPOINT_SCHEMA_TYPE.get(endpoint)
@@ -648,7 +655,6 @@ async def route_general_request(
             if span is not None:
                 span.set_attribute("vllm.backend_url", server_url)
 
-        media_type = "text/event-stream"
         try:
             stream_generator = process_request(
                 request,
@@ -668,11 +674,16 @@ async def route_general_request(
                 and key.lower() != "content-type"
             }
             headers_dict["X-Request-Id"] = request_id
+
             last_error = None
             break
         except HTTPException:
             raise
         except Exception as e:
+            router = request.app.state.router
+            if isinstance(router, PrefixAwareRouter):
+                router.mark_failed_route(request)
+
             error_urls.add(server_url)
             last_error = e
             logger.warning(
@@ -680,9 +691,18 @@ async def route_general_request(
                 f"(attempt {attempt + 1}/{max_attempts}): {e}"
             )
 
-    if last_error:
+    if last_error or stream_generator is None or status is None:
         end_span(span, error=last_error, status_code=500) if tracing_active else None
-        raise last_error
+        if last_error:
+            raise last_error
+        raise HTTPException(status_code=500, detail="Failed to route request")
+
+    router = request.app.state.router
+    if isinstance(router, PrefixAwareRouter) and 200 <= status < 400:
+        try:
+            await router.record_successful_route(request, server_url)
+        except Exception as rec_err:
+            logger.warning(f"Failed to record successful route: {rec_err}")
 
     # Wrap the generator to end parent span when streaming completes
     async def traced_stream():
@@ -775,9 +795,21 @@ async def route_orchestrated_disaggregated_request(
             headers={"X-Request-Id": request_id},
         )
 
-    # Use round-robin load balancing to select prefill and decode endpoints
+    # Get stats for routing
+    engine_stats = request.app.state.engine_stats_scraper.get_engine_stats()
+    request_stats = request.app.state.request_stats_monitor.get_request_stats(
+        time.time()
+    )
+
+    # Use hybrid routing to select prefill and decode endpoints
     prefill_endpoint = router.select_prefill_endpoint(prefiller_endpoints)
-    decode_endpoint = router.select_decode_endpoint(decoder_endpoints)
+    decode_endpoint = await router.select_decode_endpoint(
+        decoder_endpoints,
+        engine_stats,
+        request_stats,
+        request,
+        request_json,
+    )
     prefill_url = prefill_endpoint.url
     decode_url = decode_endpoint.url
 

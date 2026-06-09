@@ -100,6 +100,17 @@ def generate_static_endpoint_prefixes(models: dict[str, Any]) -> str:
     return json.dumps(endpoint_prefixes)
 
 
+def generate_tokenizer_model_names(models: dict[str, Any]) -> str:
+    tokenizer_names = {}
+    for name, details in models.items():
+        if "static_backends" in details:
+            model_name = details.get("model_name", name)
+            tokenizer_name = details.get("tokenizer_model_name")
+            if tokenizer_name:
+                tokenizer_names[model_name] = tokenizer_name
+    return json.dumps(tokenizer_names) if tokenizer_names else ""
+
+
 def read_and_process_yaml_config_file(config_path: str) -> dict[str, Any]:
     with open(config_path, encoding="utf-8") as f:
         try:
@@ -123,6 +134,10 @@ def read_and_process_yaml_config_file(config_path: str) -> dict[str, Any]:
                 )
             if aliases:
                 yaml_config["static_aliases"] = generate_static_aliases(aliases)
+            if models:
+                tokenizer_names_json = generate_tokenizer_model_names(models)
+                if tokenizer_names_json:
+                    yaml_config["tokenizer_model_names"] = tokenizer_names_json
             return yaml_config
         except (yaml.YAMLError, AttributeError) as e:
             logger.error(f"Error loading YAML config file: {e}")

@@ -14,6 +14,7 @@
 import argparse
 import json
 import sys
+from typing import Dict, Optional
 
 from vllm_router import utils
 from vllm_router.log import init_logger
@@ -75,7 +76,93 @@ def load_initial_config_from_config_file_if_required(
     return args
 
 
-def validate_static_model_types(model_types: str | None) -> None:
+def normalize_prefix_aware_per_model_config(
+    config: object,
+) -> Optional[Dict[str, Dict[str, object]]]:
+    if config is None:
+        return None
+
+    parsed_config = json.loads(config) if isinstance(config, str) else config
+    if not isinstance(parsed_config, dict):
+        raise argparse.ArgumentTypeError(
+            "--prefix-aware-per-model-config must be a JSON object"
+        )
+
+    normalized_config: Dict[str, Dict[str, object]] = {}
+    for model_name, overrides in parsed_config.items():
+        if not isinstance(model_name, str) or not model_name:
+            raise argparse.ArgumentTypeError(
+                "--prefix-aware-per-model-config keys must be model names"
+            )
+        if not isinstance(overrides, dict):
+            raise argparse.ArgumentTypeError(
+                f"--prefix-aware-per-model-config value for {model_name} must be an object"
+            )
+
+        unknown_keys = set(overrides) - {"match_threshold", "enabled"}
+        if unknown_keys:
+            raise argparse.ArgumentTypeError(
+                f"Unknown prefix-aware config keys for {model_name}: {sorted(unknown_keys)}"
+            )
+
+        normalized_overrides: Dict[str, object] = {}
+        if "match_threshold" in overrides:
+            match_threshold = overrides["match_threshold"]
+            if (
+                not isinstance(match_threshold, int)
+                or isinstance(match_threshold, bool)
+                or match_threshold < 0
+            ):
+                raise argparse.ArgumentTypeError(
+                    f"match_threshold for {model_name} must be a non-negative integer"
+                )
+            normalized_overrides["match_threshold"] = match_threshold
+
+        if "enabled" in overrides:
+            enabled = overrides["enabled"]
+            if not isinstance(enabled, bool):
+                raise argparse.ArgumentTypeError(
+                    f"enabled for {model_name} must be a boolean"
+                )
+            normalized_overrides["enabled"] = enabled
+
+        normalized_config[model_name] = normalized_overrides
+
+    return normalized_config
+
+
+def normalize_kv_aware_per_model_thresholds(
+    config: object,
+) -> Optional[Dict[str, int]]:
+    if config is None:
+        return None
+
+    parsed_config = json.loads(config) if isinstance(config, str) else config
+    if not isinstance(parsed_config, dict):
+        raise argparse.ArgumentTypeError(
+            "--kv-aware-per-model-thresholds must be a JSON object"
+        )
+
+    normalized_config: Dict[str, int] = {}
+    for model_name, threshold in parsed_config.items():
+        if not isinstance(model_name, str) or not model_name:
+            raise argparse.ArgumentTypeError(
+                "--kv-aware-per-model-thresholds keys must be model names"
+            )
+        if (
+            not isinstance(threshold, int)
+            or isinstance(threshold, bool)
+            or threshold < 0
+        ):
+            raise argparse.ArgumentTypeError(
+                f"KV-aware threshold for {model_name} must be a non-negative integer"
+            )
+        normalized_config[model_name] = threshold
+
+    return normalized_config
+
+
+def validate_static_model_types(model_types: Optional[str]) -> None:
     if model_types is None:
         raise ValueError(
             "Static model types must be provided when using the backend healthcheck."
@@ -108,6 +195,35 @@ def validate_args(args):
         raise ValueError(
             "Session key must be provided when using session routing logic."
         )
+    args.prefix_aware_match_threshold = getattr(args, "prefix_aware_match_threshold", 0)
+    if args.prefix_aware_match_threshold < 0:
+        raise ValueError(
+            "Prefix-aware match threshold must be greater than or equal to 0."
+        )
+    if args.kv_aware_threshold < 0:
+        raise ValueError("KV-aware threshold must be greater than or equal to 0.")
+    args.prefix_aware_per_model_config = normalize_prefix_aware_per_model_config(
+        getattr(args, "prefix_aware_per_model_config", None)
+    )
+    args.kv_aware_per_model_thresholds = normalize_kv_aware_per_model_thresholds(
+        getattr(args, "kv_aware_per_model_thresholds", None)
+    )
+    tokenizer_model_names = getattr(args, "tokenizer_model_names", None)
+    if tokenizer_model_names:
+        try:
+            parsed = json.loads(tokenizer_model_names)
+            if not isinstance(parsed, dict):
+                raise ValueError("--tokenizer-model-names must be a JSON object")
+            for key, value in parsed.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    raise ValueError(
+                        "--tokenizer-model-names must map string model names to string tokenizer names"
+                    )
+            args.tokenizer_model_names = parsed
+        except json.JSONDecodeError as e:
+            raise ValueError(f"--tokenizer-model-names must be valid JSON: {e}") from e
+    else:
+        args.tokenizer_model_names = None
     if args.log_stats and args.log_stats_interval <= 0:
         raise ValueError("Log stats interval must be greater than 0.")
     if args.engine_stats_interval <= 0:
@@ -254,6 +370,24 @@ def parse_args():
             "disaggregated_prefill_orchestrated",
         ],
         help="The routing logic to use",
+    )
+    parser.add_argument(
+        "--prefix-aware-match-threshold",
+        type=int,
+        default=0,
+        help="Minimum prefix match length in characters required for prefix-aware routing. Default 0 accepts any prefix match.",
+    )
+    parser.add_argument(
+        "--prefix-aware-per-model-config",
+        type=normalize_prefix_aware_per_model_config,
+        default=None,
+        help='JSON object mapping model names to prefix-aware overrides, e.g. \'{"model-a":{"match_threshold":256,"enabled":true}}\'.',
+    )
+    parser.add_argument(
+        "--tokenizer-model-names",
+        type=str,
+        default=None,
+        help='JSON object mapping model names to HuggingFace tokenizer names for local tokenizer loading, e.g. \'{"my-model":"meta-llama/Llama-2-7b-chat-hf"}\'.',
     )
     parser.add_argument(
         "--lmcache-controller-port",
@@ -470,6 +604,13 @@ def parse_args():
         type=int,
         default=2000,
         help="The threshold for kv-aware routing.",
+    )
+
+    parser.add_argument(
+        "--kv-aware-per-model-thresholds",
+        type=normalize_kv_aware_per_model_thresholds,
+        default=None,
+        help='JSON object mapping model names to KV-aware thresholds, e.g. \'{"model-a":512,"model-b":2000}\'.',
     )
 
     parser.add_argument(
