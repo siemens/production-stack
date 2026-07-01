@@ -26,10 +26,30 @@ class RequestStats:
         self.qps = qps
 
 
+class URL:
+    def __init__(self, path: str):
+        self.path = path
+
+
+class State:
+    pass
+
+
 class Request:
-    def __init__(self, headers: Dict[str, str], body: Dict[str, Any] = None):
+    def __init__(
+        self,
+        headers: Dict[str, str],
+        body: Dict[str, Any] = None,
+        path: str = "/v1/completions",
+    ):
         self.headers = headers
         self.body = body
+        self.url = URL(path)
+        self.state = State()
+
+
+def _inject_trie(router: PrefixAwareRouter, model_name: str, path: str, trie) -> None:
+    router.hashtries[f"{model_name}\n{path}"] = trie
 
 
 @pytest.mark.asyncio
@@ -49,31 +69,31 @@ async def test_route_falls_back_to_qps_when_match_below_threshold():
         "http://engine2.com": RequestStats(qps=5),
     }
     request = Request(headers={})
-    request_json = {"prompt": "some prompt text"}
+    request_json = {"model": "m", "prompt": "some prompt text"}
 
     router = PrefixAwareRouter(prefix_min_match_length=4096)
 
     fake_hashtrie = AsyncMock()
     fake_hashtrie.longest_prefix_match.return_value = (
-        0,
+        100,
         {"http://engine1.com"},
     )
-    router.hashtrie = fake_hashtrie
+    _inject_trie(router, "m", "/v1/completions", fake_hashtrie)
 
     url = await router.route_request(
         endpoints, None, request_stats, request, request_json
     )
 
     assert url == "http://engine2.com"
-
-    fake_hashtrie.insert.assert_not_awaited()
+    assert request.state.prefix_aware_ctx.used_prefix_match is False
 
 
 @pytest.mark.asyncio
 async def test_route_uses_matched_endpoint_when_match_above_threshold():
     """
     When the longest prefix match is no shorter than prefix_min_match_length,
-    the request should use the matched endpoint.
+    the request should use the matched endpoint and record the successful
+    route in the trie.
     """
 
     endpoints = [
@@ -82,7 +102,7 @@ async def test_route_uses_matched_endpoint_when_match_above_threshold():
     ]
     request_stats = {}
     request = Request(headers={})
-    request_json = {"prompt": "some prompt text"}
+    request_json = {"model": "m", "prompt": "some prompt text"}
 
     router = PrefixAwareRouter(prefix_min_match_length=128)
 
@@ -91,14 +111,16 @@ async def test_route_uses_matched_endpoint_when_match_above_threshold():
         4096,
         {"http://engine1.com"},
     )
-    router.hashtrie = fake_hashtrie
+    _inject_trie(router, "m", "/v1/completions", fake_hashtrie)
 
     url = await router.route_request(
         endpoints, None, request_stats, request, request_json
     )
 
     assert url == "http://engine1.com"
+    assert request.state.prefix_aware_ctx.used_prefix_match is True
 
+    await router.record_successful_route(request, url)
     fake_hashtrie.insert.assert_awaited_once()
 
 
@@ -106,9 +128,7 @@ async def test_route_uses_matched_endpoint_when_match_above_threshold():
 async def test_default_threshold_zero_preserves_original_behavior():
     """
     When --prefix-min-match-length is not provided, prefix_min_match_length
-    defaults to 0. Even when there is no prefix match at all (match_length 0),
-    the request still uses the matched endpoint instead of falling back,
-    preserving the original behavior before this change.
+    defaults to 0, so any non-zero prefix match uses the matched endpoint.
     """
 
     endpoints = [
@@ -117,21 +137,20 @@ async def test_default_threshold_zero_preserves_original_behavior():
     ]
     request_stats = {}
     request = Request(headers={})
-    request_json = {"prompt": "some prompt text"}
+    request_json = {"model": "m", "prompt": "some prompt text"}
 
     router = PrefixAwareRouter()
 
     fake_hashtrie = AsyncMock()
     fake_hashtrie.longest_prefix_match.return_value = (
-        0,
+        50,
         {"http://engine1.com"},
     )
-    router.hashtrie = fake_hashtrie
+    _inject_trie(router, "m", "/v1/completions", fake_hashtrie)
 
     url = await router.route_request(
         endpoints, None, request_stats, request, request_json
     )
 
     assert url == "http://engine1.com"
-
-    fake_hashtrie.insert.assert_awaited_once()
+    assert request.state.prefix_aware_ctx.used_prefix_match is True
