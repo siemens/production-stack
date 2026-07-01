@@ -10,6 +10,7 @@ import pytest
 from vllm_router.external_providers.base import ExternalProviderResponse
 from vllm_router.external_providers.models import ExternalModelConfig
 from vllm_router.external_providers.openai_provider import OpenAIProvider
+from vllm_router.utils import AliasConfig
 
 from .conftest import (
     make_mock_response,
@@ -111,6 +112,83 @@ class TestOpenAIProviderSendRequest:
             )
 
         assert captured["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_alias_reasoning_effort_is_forwarded(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        provider = OpenAIProvider(
+            make_provider_config(
+                name="openai",
+                api_key_env_var="OPENAI_API_KEY",
+                models=[
+                    ExternalModelConfig(
+                        id="gpt-5.5",
+                        aliases=[
+                            AliasConfig(model="gpt-5.5-high", reasoning_effort="high")
+                        ],
+                    )
+                ],
+            )
+        )
+        captured: dict = {}
+
+        async def fake_send(session, url, headers, payload):
+            captured.update(payload)
+            return ExternalProviderResponse(status_code=200, body={})
+
+        with (
+            mock_get_session(provider, make_mock_session()),
+            patch.object(provider, "_send_standard_request", side_effect=fake_send),
+        ):
+            await provider.send_request(
+                "/v1/chat/completions",
+                {"model": "gpt-5.5", "reasoning_effort": "high"},
+            )
+
+        assert captured["model"] == "gpt-5.5"
+        assert captured["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_effort_none_is_capitalized(self, openai_provider):
+        captured: dict = {}
+
+        async def fake_send(session, url, headers, payload):
+            captured.update(payload)
+            return ExternalProviderResponse(status_code=200, body={})
+
+        with (
+            mock_get_session(openai_provider, make_mock_session()),
+            patch.object(
+                openai_provider, "_send_standard_request", side_effect=fake_send
+            ),
+        ):
+            await openai_provider.send_request(
+                "/v1/chat/completions",
+                {"model": "gpt-4o", "reasoning_effort": "none"},
+            )
+
+        assert captured["reasoning_effort"] == "None"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_effort_other_values_untouched(self, openai_provider):
+        captured: dict = {}
+
+        async def fake_send(session, url, headers, payload):
+            captured.update(payload)
+            return ExternalProviderResponse(status_code=200, body={})
+
+        with (
+            mock_get_session(openai_provider, make_mock_session()),
+            patch.object(
+                openai_provider, "_send_standard_request", side_effect=fake_send
+            ),
+        ):
+            await openai_provider.send_request(
+                "/v1/chat/completions",
+                {"model": "gpt-4o", "reasoning_effort": "low"},
+            )
+
+        assert captured["reasoning_effort"] == "low"
 
     @pytest.mark.asyncio
     async def test_streaming_returns_stream_response(self, openai_provider):

@@ -3,7 +3,7 @@ Tests for src/vllm_router/external_providers/
 Covers: models.py, base.py, registry.py
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,6 +20,10 @@ from vllm_router.external_providers.registry import (
     ADAPTER_REGISTRY,
     ExternalProviderManager,
 )
+from vllm_router.services.request_service.request import (
+    process_external_provider_request,
+)
+from vllm_router.utils import AliasConfig
 
 from .conftest import make_provider_config
 
@@ -60,7 +64,16 @@ class TestExternalModelConfig:
         )
         assert m.id == "gpt-4o"
         assert m.type == "embedding"
-        assert m.aliases == ["gpt4o", "gpt-4"]
+        assert m.aliases == [AliasConfig(model="gpt4o"), AliasConfig(model="gpt-4")]
+
+    def test_from_dict_alias_with_reasoning_effort(self):
+        m = ExternalModelConfig.from_dict(
+            {
+                "id": "gpt-5.5",
+                "aliases": [{"name": "gpt-5.5-high", "reasoning_effort": "high"}],
+            }
+        )
+        assert m.aliases == [AliasConfig(model="gpt-5.5-high", reasoning_effort="high")]
 
 
 class TestExternalProviderConfig:
@@ -94,7 +107,7 @@ class TestExternalProviderConfig:
         assert cfg.max_retries == 5
         assert cfg.custom_headers == {"X-Custom": "value"}
         assert len(cfg.models) == 1
-        assert cfg.models[0].aliases == ["gpt4o"]
+        assert cfg.models[0].aliases == [AliasConfig(model="gpt4o")]
 
     def test_get_api_key_from_env(self, monkeypatch):
         monkeypatch.setenv("MY_API_KEY", "sk-test-123")
@@ -147,6 +160,14 @@ class TestExternalProviderConfig:
     def test_resolve_model_id_not_found(self):
         cfg = make_provider_config(models=[ExternalModelConfig(id="gpt-4o")])
         assert cfg.resolve_model_id("unknown-model") is None
+
+    def test_resolve_alias_config(self):
+        alias = AliasConfig(model="gpt-5.5-high", reasoning_effort="high")
+        cfg = make_provider_config(
+            models=[ExternalModelConfig(id="gpt-5.5", aliases=[alias])]
+        )
+        assert cfg.resolve_alias_config("gpt-5.5-high") == alias
+        assert cfg.resolve_alias_config("gpt-5.5") is None
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +287,27 @@ class TestExternalProviderManagerLookup:
     def test_get_provider_name(self, registered_manager, model_id):
         assert registered_manager.get_provider_name(model_id) == "openai"
 
+    def test_get_alias_config(self, manager, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        manager.register(
+            make_provider_config(
+                name="openai",
+                models=[
+                    ExternalModelConfig(
+                        id="gpt-5.5",
+                        aliases=[
+                            AliasConfig(model="gpt-5.5-high", reasoning_effort="high")
+                        ],
+                    )
+                ],
+                api_key_env_var="OPENAI_API_KEY",
+            )
+        )
+        assert manager.get_alias_config("gpt-5.5-high") == AliasConfig(
+            model="gpt-5.5-high", reasoning_effort="high"
+        )
+        assert manager.get_alias_config("gpt-5.5") is None
+
     def test_get_all_external_model_ids(self, registered_manager):
         assert set(registered_manager.get_all_external_model_ids()) == {
             "gpt-4o",
@@ -323,6 +365,85 @@ class TestExternalProviderManagerHealthCheck:
             side_effect=RuntimeError("boom")
         )
         assert await registered_manager.health_check() == {"openai": False}
+
+
+class TestProcessExternalProviderRequest:
+    @pytest.mark.asyncio
+    async def test_alias_injects_reasoning_effort(self, manager, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        manager.register(
+            make_provider_config(
+                name="openai",
+                models=[
+                    ExternalModelConfig(
+                        id="gpt-5.5",
+                        aliases=[
+                            AliasConfig(model="gpt-5.5-high", reasoning_effort="high")
+                        ],
+                    )
+                ],
+                api_key_env_var="OPENAI_API_KEY",
+            )
+        )
+        adapter = manager.lookup_adapter("gpt-5.5-high")
+        adapter.send_request = AsyncMock(
+            return_value=ExternalProviderResponse(status_code=200, body={"ok": True})
+        )
+
+        request = MagicMock()
+        request.app.state.external_provider_registry = manager
+        request_json = {"model": "gpt-5.5-high"}
+
+        response = await process_external_provider_request(
+            request,
+            "/v1/chat/completions",
+            request_json,
+            "req-123",
+            MagicMock(),
+        )
+
+        assert response.status_code == 200
+        forwarded_payload = adapter.send_request.await_args.kwargs["payload"]
+        assert forwarded_payload["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_alias_does_not_overwrite_client_reasoning_effort(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        manager.register(
+            make_provider_config(
+                name="openai",
+                models=[
+                    ExternalModelConfig(
+                        id="gpt-5.5",
+                        aliases=[
+                            AliasConfig(model="gpt-5.5-high", reasoning_effort="high")
+                        ],
+                    )
+                ],
+                api_key_env_var="OPENAI_API_KEY",
+            )
+        )
+        adapter = manager.lookup_adapter("gpt-5.5-high")
+        adapter.send_request = AsyncMock(
+            return_value=ExternalProviderResponse(status_code=200, body={"ok": True})
+        )
+
+        request = MagicMock()
+        request.app.state.external_provider_registry = manager
+        request_json = {"model": "gpt-5.5-high", "reasoning_effort": "low"}
+
+        await process_external_provider_request(
+            request,
+            "/v1/chat/completions",
+            request_json,
+            "req-123",
+            MagicMock(),
+        )
+
+        forwarded_payload = adapter.send_request.await_args.kwargs["payload"]
+        assert forwarded_payload["reasoning_effort"] == "low"
 
 
 class TestExternalProviderManagerClose:
