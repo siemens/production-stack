@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import abc
 import asyncio
 import concurrent.futures
 import enum
+import inspect
 import math
-import random
 import threading
 import uuid
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import requests
@@ -41,12 +44,113 @@ except ImportError:
 from uhashring import HashRing
 
 from vllm_router.log import init_logger
+from vllm_router.prefix.hashtrie import HashTrie
 from vllm_router.service_discovery import EndpointInfo
 from vllm_router.stats.engine_stats import EngineStats
 from vllm_router.stats.request_stats import RequestStats
 from vllm_router.utils import SingletonABCMeta
 
 logger = init_logger(__name__)
+
+
+def _serialize_prefix_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return _serialize_prefix_content_block(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            serialized = _serialize_prefix_content(part)
+            if serialized:
+                parts.append(serialized)
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _serialize_prefix_content_block(content_block: dict) -> str:
+    part_type = str(content_block.get("type", "")).strip()
+    if part_type in {"text", "input_text", "output_text"}:
+        text = content_block.get("text", "")
+        return str(text) if text else ""
+    if part_type:
+        return f"[{part_type}]"
+
+    text = content_block.get("text", "")
+    if text:
+        return str(text)
+    return str(content_block)
+
+
+def _build_prefix_message_lines(messages: object) -> list[str]:
+    if not isinstance(messages, list):
+        return []
+
+    lines: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            lines.append(str(message))
+            continue
+
+        role = str(message.get("role", "user")).strip().lower() or "user"
+        name = str(message.get("name", "")).strip()
+        header = f"<|{role}:{name}|>" if name else f"<|{role}|>"
+        content = _serialize_prefix_content(message.get("content", ""))
+        lines.append(f"{header}\n{content}")
+    return lines
+
+
+def _build_chat_prefix_key(request_json: dict) -> str:
+    lines: list[str] = []
+
+    system_content = request_json.get("system")
+    if system_content:
+        lines.append(f"<|system|>\n{_serialize_prefix_content(system_content)}")
+
+    instructions = request_json.get("instructions")
+    if instructions:
+        lines.append(f"<|developer|>\n{_serialize_prefix_content(instructions)}")
+
+    lines.extend(_build_prefix_message_lines(request_json.get("messages", [])))
+
+    return "\n<|message-break|>\n".join(lines)
+
+
+def _build_responses_prefix_key(request_json: dict) -> str:
+    lines: list[str] = []
+
+    instructions = request_json.get("instructions")
+    if instructions:
+        lines.append(f"<|developer|>\n{_serialize_prefix_content(instructions)}")
+
+    response_input = request_json.get("input", "")
+    if isinstance(response_input, str):
+        lines.append(f"<|input|>\n{response_input}")
+    elif isinstance(response_input, list):
+        lines.extend(_build_prefix_message_lines(response_input))
+    elif response_input is not None:
+        lines.append(_serialize_prefix_content(response_input))
+
+    return "\n<|message-break|>\n".join(lines)
+
+
+def _build_request_prefix_key(request_json: dict) -> str:
+    if "messages" in request_json:
+        return _build_chat_prefix_key(request_json)
+
+    if "input" in request_json:
+        return _build_responses_prefix_key(request_json)
+
+    prompt = request_json.get("prompt", "")
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        return "\n<|prompt-break|>\n".join(str(item) for item in prompt)
+    if prompt is None:
+        return ""
+    return str(prompt)
 
 
 class RoutingLogic(str, enum.Enum):
@@ -266,6 +370,8 @@ class KvawareRouter(RoutingInterface):
         lmcache_worker_timeout: int = 30,
         lmcache_controller_reply_port: Optional[int] = None,
         lmcache_controller_heartbeat_port: Optional[int] = None,
+        tokenizer_model_names: Optional[Dict[str, str]] = None,
+        kv_aware_per_model_thresholds: Optional[Dict[str, int]] = None,
     ):
         self.lmcache_controller_port = lmcache_controller_port
         self.lmcache_controller_reply_port = lmcache_controller_reply_port
@@ -296,8 +402,17 @@ class KvawareRouter(RoutingInterface):
         self.instance_id_to_ip = {}
         self.session_key = session_key
         self.hash_ring = HashRing()
-        self.tokenizer = None
+        self.tokenizers = {}
         self.threshold = kv_aware_threshold
+        self.tokenizer_model_names = tokenizer_model_names or {}
+        self.per_model_thresholds = kv_aware_per_model_thresholds or {}
+
+    def _get_tokenizer(self, tokenizer_name: str):
+        tokenizer = self.tokenizers.get(tokenizer_name)
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+            self.tokenizers[tokenizer_name] = tokenizer
+        return tokenizer
 
     def start_kv_manager(self):
         """
@@ -310,11 +425,13 @@ class KvawareRouter(RoutingInterface):
             self.kv_manager.start_all(), self.loop
         )
 
-    def query_manager(self, msg) -> str:
+    async def query_manager(self, msg) -> str:
         """
         Get the instance id for the given message
         """
         instance_id = self.kv_manager.handle_orchestration_message(msg)
+        if inspect.isawaitable(instance_id):
+            instance_id = await instance_id
         return instance_id
 
     def close(self):
@@ -356,21 +473,25 @@ class KvawareRouter(RoutingInterface):
             longest prefix match)
         """
         token_ids = None
+        _request_json = request_json or {}
+        prompt = _build_request_prefix_key(_request_json)
+        model_name = _request_json.get("model")
+        if not model_name and endpoints:
+            model_name = endpoints[0].model_names[0]
+        threshold = self.per_model_thresholds.get(model_name, self.threshold)
+
         # Local-first tokenization, fall back to remote "/tokenize" API on failure
-        # TODO (Yuhan): Handle chat completions
         try:
-            if self.tokenizer is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    endpoints[0].model_names[0]
-                )
-            token_ids = self.tokenizer.encode((request_json or {}).get("prompt", ""))
+            tokenizer_name = self.tokenizer_model_names.get(model_name, model_name)
+            tokenizer = self._get_tokenizer(tokenizer_name)
+            token_ids = tokenizer.encode(prompt)
         except Exception:
             # Remote /tokenize fallback (let errors bubble up to keep behavior simple)
             remote_url = endpoints[0].url + "/tokenize"
             headers = {"Content-Type": "application/json"}
             data = {
                 "model": endpoints[0].model_names[0],
-                "prompt": (request_json or {}).get("prompt", ""),
+                "prompt": prompt,
             }
             body = requests.post(
                 remote_url, headers=headers, json=data, timeout=10
@@ -382,7 +503,7 @@ class KvawareRouter(RoutingInterface):
         instance_id = await self.query_manager(msg)
         matched_tokens = math.inf
         logger.debug(f"Lookup return message: {instance_id}")
-        if len(list(instance_id.layout_info.keys())) > 0:
+        if instance_id is not None and len(list(instance_id.layout_info.keys())) > 0:
             matched_instance_id = list(instance_id.layout_info.keys())[
                 0
             ]  # Get the first key
@@ -391,7 +512,7 @@ class KvawareRouter(RoutingInterface):
         if (
             instance_id is None
             or len(instance_id.layout_info) == 0
-            or matched_tokens < max(len(token_ids) - self.threshold, 0)
+            or matched_tokens < max(len(token_ids) - threshold, 0)
         ):
             session_id = self.extract_session_id(request, request_json)
             logger.debug(f"Fallback to using session id: {session_id}")
@@ -430,25 +551,209 @@ class KvawareRouter(RoutingInterface):
             return self.instance_id_to_ip[queried_instance_ids[0]]
 
 
+@dataclass(slots=True)
+class PrefixRouteContext:
+    model_name: str
+    trie_key: str
+    prefix_key: str
+    selected_url: str
+    used_prefix_match: bool
+    match_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixAwareModelConfig:
+    match_threshold: int = 0
+    enabled: bool = True
+
+
 class PrefixAwareRouter(RoutingInterface):
     """
     Route the request to the appropriate engine URL by where the longest
     prefix match is found.
 
-    In this class, we assume that there is no eviction of prefix cache.
+    Uses model-scoped HashTries to avoid cross-model prefix contamination.
+    For chat completions, builds role-aware prefix keys from message structure.
+    Selects among matched endpoints using QPS-based load balancing.
+    Defers trie insertion until the backend successfully accepts the request.
     """
 
     def __init__(
         self,
         prefix_min_match_length: int = 0,
+        prefix_aware_match_threshold: int = 0,
+        prefix_aware_per_model_config: Optional[Dict[str, Dict[str, object]]] = None,
     ):
         if hasattr(self, "_initialized"):
             return
-        from vllm_router.prefix.hashtrie import HashTrie
 
-        self.hashtrie = HashTrie()
         self.prefix_min_match_length = prefix_min_match_length
+        self.global_config = PrefixAwareModelConfig(
+            match_threshold=self._validate_match_threshold(
+                prefix_aware_match_threshold, "global"
+            ),
+        )
+        self.per_model_config = self._build_per_model_config(
+            prefix_aware_per_model_config
+        )
+        self.hashtries: dict[str, HashTrie] = {}
+        self._hashtries_lock = asyncio.Lock()
         self._initialized = True
+
+    @staticmethod
+    def _validate_match_threshold(value: object, config_name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(
+                f"Prefix-aware match_threshold for {config_name} must be a non-negative integer"
+            )
+        return value
+
+    def _build_per_model_config(
+        self, per_model_config: Optional[Dict[str, Dict[str, object]]]
+    ) -> dict[str, PrefixAwareModelConfig]:
+        configs: dict[str, PrefixAwareModelConfig] = {}
+        for model_name, overrides in (per_model_config or {}).items():
+            if not isinstance(model_name, str) or not model_name:
+                raise ValueError(
+                    "Prefix-aware per-model config keys must be model names"
+                )
+            if not isinstance(overrides, dict):
+                raise ValueError(
+                    f"Prefix-aware per-model config for {model_name} must be an object"
+                )
+
+            unknown_keys = set(overrides) - {"match_threshold", "enabled"}
+            if unknown_keys:
+                raise ValueError(
+                    f"Unknown prefix-aware config keys for {model_name}: {sorted(unknown_keys)}"
+                )
+
+            enabled = overrides.get("enabled", self.global_config.enabled)
+            if not isinstance(enabled, bool):
+                raise ValueError(
+                    f"Prefix-aware enabled override for {model_name} must be a boolean"
+                )
+
+            match_threshold = self._validate_match_threshold(
+                overrides.get("match_threshold", self.global_config.match_threshold),
+                model_name,
+            )
+            configs[model_name] = PrefixAwareModelConfig(
+                match_threshold=match_threshold,
+                enabled=enabled,
+            )
+        return configs
+
+    def _get_model_config(self, model_name: str) -> PrefixAwareModelConfig:
+        return self.per_model_config.get(model_name, self.global_config)
+
+    async def _get_hashtrie(self, model_name: str) -> HashTrie:
+        trie = self.hashtries.get(model_name)
+        if trie is not None:
+            return trie
+
+        async with self._hashtries_lock:
+            trie = self.hashtries.get(model_name)
+            if trie is None:
+                trie = HashTrie()
+                self.hashtries[model_name] = trie
+            return trie
+
+    @staticmethod
+    def _serialize_content(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            return PrefixAwareRouter._serialize_content_block(content)
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                serialized = PrefixAwareRouter._serialize_content(part)
+                if serialized:
+                    parts.append(serialized)
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    @staticmethod
+    def _serialize_content_block(content_block: dict) -> str:
+        part_type = str(content_block.get("type", "")).strip()
+        if part_type in {"text", "input_text", "output_text"}:
+            text = content_block.get("text", "")
+            return str(text) if text else ""
+        if part_type:
+            return f"[{part_type}]"
+
+        text = content_block.get("text", "")
+        if text:
+            return str(text)
+        return str(content_block)
+
+    def _build_message_lines(self, messages: object) -> list[str]:
+        if not isinstance(messages, list):
+            return []
+
+        lines: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                lines.append(str(message))
+                continue
+
+            role = str(message.get("role", "user")).strip().lower() or "user"
+            name = str(message.get("name", "")).strip()
+            header = f"<|{role}:{name}|>" if name else f"<|{role}|>"
+            content = self._serialize_content(message.get("content", ""))
+            lines.append(f"{header}\n{content}")
+        return lines
+
+    def _build_chat_prefix(self, request_json: dict) -> str:
+        lines: list[str] = []
+
+        system_content = request_json.get("system")
+        if system_content:
+            lines.append(f"<|system|>\n{self._serialize_content(system_content)}")
+
+        instructions = request_json.get("instructions")
+        if instructions:
+            lines.append(f"<|developer|>\n{self._serialize_content(instructions)}")
+
+        lines.extend(self._build_message_lines(request_json.get("messages", [])))
+
+        return "\n<|message-break|>\n".join(lines)
+
+    def _build_responses_prefix(self, request_json: dict) -> str:
+        lines: list[str] = []
+
+        instructions = request_json.get("instructions")
+        if instructions:
+            lines.append(f"<|developer|>\n{self._serialize_content(instructions)}")
+
+        response_input = request_json.get("input", "")
+        if isinstance(response_input, str):
+            lines.append(f"<|input|>\n{response_input}")
+        elif isinstance(response_input, list):
+            lines.extend(self._build_message_lines(response_input))
+        elif response_input is not None:
+            lines.append(self._serialize_content(response_input))
+
+        return "\n<|message-break|>\n".join(lines)
+
+    def _build_prefix_key(self, request_json: dict) -> str:
+        if "messages" in request_json:
+            return self._build_chat_prefix(request_json)
+
+        if "input" in request_json:
+            return self._build_responses_prefix(request_json)
+
+        prompt = request_json.get("prompt", "")
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, list):
+            return "\n<|prompt-break|>\n".join(str(item) for item in prompt)
+        if prompt is None:
+            return ""
+        return str(prompt)
 
     async def route_request(
         self,
@@ -462,7 +767,8 @@ class PrefixAwareRouter(RoutingInterface):
         Route the request to the appropriate engine URL by where the longest
         prefix match is found.
 
-        In this routing logic, we do not consider the eviction of prefix cache.
+        If the request has `prefix_aware_bypass` set (from a prior failed
+        prefix-routed attempt), falls back to QPS routing directly.
 
         Args:
             endpoints (List[EndpointInfo]): The list of engine URLs
@@ -474,59 +780,147 @@ class PrefixAwareRouter(RoutingInterface):
             request_json (Dict): The request body (needed for finding the
             longest prefix match)
         """
+        if not endpoints:
+            raise ValueError("PrefixAwareRouter requires at least one endpoint")
 
-        # Handle chat completions
         _request_json = request_json or {}
-        if "messages" in _request_json:
-            # Get the last message from the messages array
-            messages = _request_json["messages"]
-            if messages:
-                # Concatenate all message content
-                prompt_parts = []
-                for message in messages:
-                    content = message.get("content", "")
-                    if isinstance(content, list):
-                        # Handle multimodal messages
-                        text_content = " ".join(
-                            part.get("text", "")
-                            for part in content
-                            if part.get("type") == "text"
-                        )
-                        prompt_parts.append(text_content)
-                    elif content is not None:
-                        prompt_parts.append(content)
-                prompt = "\n".join(prompt_parts)
-            else:
-                prompt = ""
-        else:
-            # Handle regular completions
-            prompt = _request_json["prompt"]
 
-        available_endpoints = set(endpoint.url for endpoint in endpoints)
-        match_length, matched_endpoint = await self.hashtrie.longest_prefix_match(
-            prompt, available_endpoints
-        )
-
-        if match_length < self.prefix_min_match_length:
+        if getattr(request.state, "prefix_aware_bypass", False):
+            logger.warning("Falling back to QPS routing after prefix match failure")
             return self._qps_routing(endpoints, request_stats)
 
-        selected_endpoint = random.choice(list(matched_endpoint))
+        model_name = _request_json.get("model")
+        if not isinstance(model_name, str) or not model_name:
+            logger.warning(
+                "Missing model for prefix-aware routing, falling back to QPS"
+            )
+            return self._qps_routing(endpoints, request_stats)
 
-        await self.hashtrie.insert(prompt, selected_endpoint)
+        model_config = self._get_model_config(model_name)
+        if not model_config.enabled:
+            logger.debug(
+                f"Prefix-aware routing disabled for model={model_name}, falling back to QPS"
+            )
+            return self._qps_routing(endpoints, request_stats)
 
-        return selected_endpoint
+        raw_prefix_key = self._build_prefix_key(_request_json)
+        if not raw_prefix_key:
+            logger.debug("Empty prefix key, falling back to QPS routing")
+            return self._qps_routing(endpoints, request_stats)
+        trie_key = f"{model_name}\n{request.url.path}"
+        prefix_key = raw_prefix_key
+
+        trie = await self._get_hashtrie(trie_key)
+        available_urls = {ep.url for ep in endpoints}
+        match_length, matched_urls = await trie.longest_prefix_match(
+            prefix_key,
+            available_urls,
+        )
+
+        use_prefix_match = (
+            match_length > 0
+            and bool(matched_urls)
+            and match_length >= model_config.match_threshold
+            and match_length >= self.prefix_min_match_length
+        )
+        candidate_urls = matched_urls if use_prefix_match else available_urls
+        candidate_endpoints = [ep for ep in endpoints if ep.url in candidate_urls]
+
+        if not candidate_endpoints:
+            candidate_endpoints = endpoints
+            use_prefix_match = False
+
+        selected_url = self._qps_routing(candidate_endpoints, request_stats)
+
+        request.state.prefix_aware_ctx = PrefixRouteContext(
+            model_name=model_name,
+            trie_key=trie_key,
+            prefix_key=prefix_key,
+            selected_url=selected_url,
+            used_prefix_match=use_prefix_match,
+            match_length=match_length,
+        )
+
+        logger.info(
+            f"Prefix-aware routing: model={model_name}, "
+            f"match_length={match_length}, "
+            f"match_threshold={model_config.match_threshold}, "
+            f"used_prefix_match={use_prefix_match}, "
+            f"selected_url={selected_url}"
+        )
+
+        return selected_url
+
+    async def record_successful_route(
+        self, request: Request, selected_url: str
+    ) -> None:
+        ctx: Optional[PrefixRouteContext] = getattr(
+            request.state, "prefix_aware_ctx", None
+        )
+        if ctx is None or not ctx.prefix_key:
+            return
+
+        trie = await self._get_hashtrie(ctx.trie_key)
+        await trie.insert(ctx.prefix_key, selected_url)
+
+        logger.info(
+            f"Recorded prefix route: model={ctx.model_name}, "
+            f"endpoint={selected_url}, "
+            f"prefix_len={len(ctx.prefix_key)}"
+        )
+
+    def mark_failed_route(self, request: Request) -> None:
+        ctx: Optional[PrefixRouteContext] = getattr(
+            request.state, "prefix_aware_ctx", None
+        )
+        if ctx is not None and ctx.used_prefix_match:
+            request.state.prefix_aware_bypass = True
+            logger.info(
+                f"Prefix route failed for model={ctx.model_name}, "
+                f"switching to bypass mode for this request"
+            )
 
 
 class DisaggregatedPrefillRouter(RoutingInterface):
     """
     Route the request to the appropriate engine URL by handling prefill and decode operations sequentially.
     First request goes to prefill endpoint, then second request goes to decode endpoint.
+
+    Decode endpoint selection uses kv-aware routing when configured.
     """
 
-    def __init__(self, prefill_model_labels: List[str], decode_model_labels: List[str]):
+    def __init__(
+        self,
+        prefill_model_labels: List[str],
+        decode_model_labels: List[str],
+        tokenizer_model_names: Optional[Dict[str, str]] = None,
+        lmcache_controller_port: Optional[int] = None,
+        kv_aware_threshold: int = 2000,
+        kv_aware_per_model_thresholds: Optional[Dict[str, int]] = None,
+        lmcache_health_check_interval: int = 5,
+        lmcache_worker_timeout: int = 30,
+        lmcache_controller_reply_port: Optional[int] = None,
+        lmcache_controller_heartbeat_port: Optional[int] = None,
+    ):
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
         self.request_cache = {}  # Cache to store prefill results
+
+        if lmcache_controller_port is not None:
+            self._kv_router = KvawareRouter(
+                lmcache_controller_port=lmcache_controller_port,
+                session_key=None,
+                kv_aware_threshold=kv_aware_threshold,
+                lmcache_health_check_interval=lmcache_health_check_interval,
+                lmcache_worker_timeout=lmcache_worker_timeout,
+                lmcache_controller_reply_port=lmcache_controller_reply_port,
+                lmcache_controller_heartbeat_port=lmcache_controller_heartbeat_port,
+                tokenizer_model_names=tokenizer_model_names,
+                kv_aware_per_model_thresholds=kv_aware_per_model_thresholds,
+            )
+            self._kv_router.start_kv_manager()
+        else:
+            self._kv_router = None
 
     async def route_request(
         self,
@@ -557,7 +951,44 @@ class DisaggregatedPrefillRouter(RoutingInterface):
         if is_prefill:
             return prefiller_endpoints[0].url
         else:
-            return decoder_endpoints[0].url
+            # Decode: use kv-aware routing when configured
+            selected = await self._select_decode_endpoint(
+                decoder_endpoints, engine_stats, request_stats, request, request_json
+            )
+            return selected.url
+
+    async def _select_decode_endpoint(
+        self,
+        decoder_endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+        request_json: Optional[Dict] = None,
+    ) -> EndpointInfo:
+        """Select decode endpoint using kv-aware routing when configured."""
+        if not decoder_endpoints:
+            raise ValueError("No decode endpoints available")
+
+        if self._kv_router is not None:
+            try:
+                kv_url = await self._kv_router.route_request(
+                    decoder_endpoints,
+                    engine_stats,
+                    request_stats,
+                    request,
+                    request_json,
+                )
+                for ep in decoder_endpoints:
+                    if ep.url == kv_url:
+                        logger.info(f"Decode selected via kv-aware: {kv_url}")
+                        return ep
+                logger.warning(f"KV-aware returned stale decode endpoint: {kv_url}")
+            except Exception as e:
+                logger.warning(f"KV-aware routing failed for decode: {e}")
+
+        # Fall back to first endpoint
+        logger.info(f"Decode selected via fallback: {decoder_endpoints[0].url}")
+        return decoder_endpoints[0]
 
 
 class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
@@ -573,6 +1004,7 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
     5. Streams decode response back to client
 
     Load balancing: Uses round-robin across available prefill and decode pods.
+    Decode endpoint selection uses kv-aware routing when configured.
     """
 
     def __init__(
@@ -581,6 +1013,14 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         decode_model_labels: List[str],
         fallback_routing_logic: Optional[str] = None,
         session_key: Optional[str] = None,
+        tokenizer_model_names: Optional[Dict[str, str]] = None,
+        lmcache_controller_port: Optional[int] = None,
+        kv_aware_threshold: int = 2000,
+        kv_aware_per_model_thresholds: Optional[Dict[str, int]] = None,
+        lmcache_health_check_interval: int = 5,
+        lmcache_worker_timeout: int = 30,
+        lmcache_controller_reply_port: Optional[int] = None,
+        lmcache_controller_heartbeat_port: Optional[int] = None,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -598,12 +1038,29 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         else:
             self._fallback_router = RoundRobinRouter()
 
+        if lmcache_controller_port is not None:
+            self._kv_router = KvawareRouter(
+                lmcache_controller_port=lmcache_controller_port,
+                session_key=session_key,
+                kv_aware_threshold=kv_aware_threshold,
+                lmcache_health_check_interval=lmcache_health_check_interval,
+                lmcache_worker_timeout=lmcache_worker_timeout,
+                lmcache_controller_reply_port=lmcache_controller_reply_port,
+                lmcache_controller_heartbeat_port=lmcache_controller_heartbeat_port,
+                tokenizer_model_names=tokenizer_model_names,
+                kv_aware_per_model_thresholds=kv_aware_per_model_thresholds,
+            )
+            self._kv_router.start_kv_manager()
+        else:
+            self._kv_router = None
+
         self._initialized = True
         logger.info(
             f"Initialized DisaggregatedPrefillOrchestratedRouter with "
             f"prefill_labels={self.prefill_model_labels}, "
             f"decode_labels={self.decode_model_labels}, "
-            f"fallback={type(self._fallback_router).__name__}"
+            f"fallback={type(self._fallback_router).__name__}, "
+            f"kv_aware={self._kv_router is not None}"
         )
 
     def _find_endpoints(self, endpoints: List[EndpointInfo]):
@@ -654,16 +1111,44 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         self.prefill_idx += 1
         return selected
 
-    def select_decode_endpoint(
-        self, decoder_endpoints: List[EndpointInfo]
+    async def select_decode_endpoint(
+        self,
+        decoder_endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+        request_json: Optional[Dict] = None,
     ) -> EndpointInfo:
-        """Select decode endpoint using round-robin load balancing."""
+        """Select decode endpoint using kv-aware routing when configured.
+
+        1. Try kv-aware routing when LMCache is configured.
+        2. Fall back to round-robin if no usable kv route is found.
+        """
         if not decoder_endpoints:
             raise ValueError("No decode endpoints available")
-        # Sort for consistency across requests
+
+        if self._kv_router is not None:
+            try:
+                kv_url = await self._kv_router.route_request(
+                    decoder_endpoints,
+                    engine_stats,
+                    request_stats,
+                    request,
+                    request_json,
+                )
+                for ep in decoder_endpoints:
+                    if ep.url == kv_url:
+                        logger.info(f"Decode selected via kv-aware: {kv_url}")
+                        return ep
+                logger.warning(f"KV-aware returned stale decode endpoint: {kv_url}")
+            except Exception as e:
+                logger.warning(f"KV-aware routing failed for decode: {e}")
+
+        # Fall back to round-robin
         sorted_endpoints = sorted(decoder_endpoints, key=lambda e: e.url)
         selected = sorted_endpoints[self.decode_idx % len(sorted_endpoints)]
         self.decode_idx += 1
+        logger.info(f"Decode selected via round-robin: {selected.url}")
         return selected
 
     async def route_request(
@@ -708,17 +1193,34 @@ def initialize_routing_logic(
             lmcache_controller_heartbeat_port=kwargs.get(
                 "lmcache_controller_heartbeat_port"
             ),
+            tokenizer_model_names=kwargs.get("tokenizer_model_names"),
+            kv_aware_per_model_thresholds=kwargs.get("kv_aware_per_model_thresholds"),
         )
         router.start_kv_manager()
     elif routing_logic == RoutingLogic.PREFIXAWARE:
         logger.info("Initializing prefix-aware routing logic")
         router = PrefixAwareRouter(
             prefix_min_match_length=kwargs.get("prefix_min_match_length", 0),
+            prefix_aware_match_threshold=kwargs.get("prefix_aware_match_threshold", 0),
+            prefix_aware_per_model_config=kwargs.get("prefix_aware_per_model_config"),
         )
     elif routing_logic == RoutingLogic.DISAGGREGATED_PREFILL:
         logger.info("Initializing disaggregated prefill routing logic")
         router = DisaggregatedPrefillRouter(
-            kwargs.get("prefill_model_labels"), kwargs.get("decode_model_labels")
+            kwargs.get("prefill_model_labels"),
+            kwargs.get("decode_model_labels"),
+            tokenizer_model_names=kwargs.get("tokenizer_model_names"),
+            lmcache_controller_port=kwargs.get("lmcache_controller_port"),
+            kv_aware_threshold=kwargs.get("kv_aware_threshold", 2000),
+            kv_aware_per_model_thresholds=kwargs.get("kv_aware_per_model_thresholds"),
+            lmcache_health_check_interval=kwargs.get(
+                "lmcache_health_check_interval", 5
+            ),
+            lmcache_worker_timeout=kwargs.get("lmcache_worker_timeout", 30),
+            lmcache_controller_reply_port=kwargs.get("lmcache_controller_reply_port"),
+            lmcache_controller_heartbeat_port=kwargs.get(
+                "lmcache_controller_heartbeat_port"
+            ),
         )
     elif routing_logic == RoutingLogic.DISAGGREGATED_PREFILL_ORCHESTRATED:
         logger.info("Initializing disaggregated prefill orchestrated routing logic")
@@ -727,6 +1229,18 @@ def initialize_routing_logic(
             kwargs.get("decode_model_labels"),
             fallback_routing_logic=kwargs.get("fallback_routing_logic"),
             session_key=kwargs.get("session_key"),
+            tokenizer_model_names=kwargs.get("tokenizer_model_names"),
+            lmcache_controller_port=kwargs.get("lmcache_controller_port"),
+            kv_aware_threshold=kwargs.get("kv_aware_threshold", 2000),
+            kv_aware_per_model_thresholds=kwargs.get("kv_aware_per_model_thresholds"),
+            lmcache_health_check_interval=kwargs.get(
+                "lmcache_health_check_interval", 5
+            ),
+            lmcache_worker_timeout=kwargs.get("lmcache_worker_timeout", 30),
+            lmcache_controller_reply_port=kwargs.get("lmcache_controller_reply_port"),
+            lmcache_controller_heartbeat_port=kwargs.get(
+                "lmcache_controller_heartbeat_port"
+            ),
         )
     else:
         raise ValueError(f"Invalid routing logic {routing_logic}")
