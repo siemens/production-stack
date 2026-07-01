@@ -886,13 +886,15 @@ class DisaggregatedPrefillRouter(RoutingInterface):
     Route the request to the appropriate engine URL by handling prefill and decode operations sequentially.
     First request goes to prefill endpoint, then second request goes to decode endpoint.
 
-    Decode endpoint selection uses kv-aware routing when configured.
+    Decode endpoint selection tries kv-aware, then prefix-aware, then fallback.
     """
 
     def __init__(
         self,
         prefill_model_labels: List[str],
         decode_model_labels: List[str],
+        prefix_aware_match_threshold: int = 0,
+        prefix_aware_per_model_config: Optional[Dict[str, Dict[str, object]]] = None,
         tokenizer_model_names: Optional[Dict[str, str]] = None,
         lmcache_controller_port: Optional[int] = None,
         kv_aware_threshold: int = 2000,
@@ -905,6 +907,11 @@ class DisaggregatedPrefillRouter(RoutingInterface):
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
         self.request_cache = {}  # Cache to store prefill results
+
+        self._prefix_router = PrefixAwareRouter(
+            prefix_aware_match_threshold=prefix_aware_match_threshold,
+            prefix_aware_per_model_config=prefix_aware_per_model_config,
+        )
 
         if lmcache_controller_port is not None:
             self._kv_router = KvawareRouter(
@@ -965,7 +972,7 @@ class DisaggregatedPrefillRouter(RoutingInterface):
         request: Request,
         request_json: Optional[Dict] = None,
     ) -> EndpointInfo:
-        """Select decode endpoint using kv-aware routing when configured."""
+        """Select decode endpoint using kv-aware, then prefix-aware fallback."""
         if not decoder_endpoints:
             raise ValueError("No decode endpoints available")
 
@@ -986,6 +993,23 @@ class DisaggregatedPrefillRouter(RoutingInterface):
             except Exception as e:
                 logger.warning(f"KV-aware routing failed for decode: {e}")
 
+        try:
+            prefix_url = await self._prefix_router.route_request(
+                decoder_endpoints,
+                engine_stats,
+                request_stats,
+                request,
+                request_json,
+            )
+            ctx = getattr(request.state, "prefix_aware_ctx", None)
+            if ctx and ctx.used_prefix_match:
+                for ep in decoder_endpoints:
+                    if ep.url == prefix_url:
+                        logger.info(f"Decode selected via prefix-aware: {prefix_url}")
+                        return ep
+        except Exception as e:
+            logger.warning(f"Prefix-aware routing failed for decode: {e}")
+
         # Fall back to first endpoint
         logger.info(f"Decode selected via fallback: {decoder_endpoints[0].url}")
         return decoder_endpoints[0]
@@ -1004,7 +1028,7 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
     5. Streams decode response back to client
 
     Load balancing: Uses round-robin across available prefill and decode pods.
-    Decode endpoint selection uses kv-aware routing when configured.
+    Decode endpoint selection tries kv-aware, then prefix-aware, then round-robin.
     """
 
     def __init__(
@@ -1013,6 +1037,8 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         decode_model_labels: List[str],
         fallback_routing_logic: Optional[str] = None,
         session_key: Optional[str] = None,
+        prefix_aware_match_threshold: int = 0,
+        prefix_aware_per_model_config: Optional[Dict[str, Dict[str, object]]] = None,
         tokenizer_model_names: Optional[Dict[str, str]] = None,
         lmcache_controller_port: Optional[int] = None,
         kv_aware_threshold: int = 2000,
@@ -1038,6 +1064,11 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         else:
             self._fallback_router = RoundRobinRouter()
 
+        self._prefix_router = PrefixAwareRouter(
+            prefix_aware_match_threshold=prefix_aware_match_threshold,
+            prefix_aware_per_model_config=prefix_aware_per_model_config,
+        )
+
         if lmcache_controller_port is not None:
             self._kv_router = KvawareRouter(
                 lmcache_controller_port=lmcache_controller_port,
@@ -1060,6 +1091,7 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
             f"prefill_labels={self.prefill_model_labels}, "
             f"decode_labels={self.decode_model_labels}, "
             f"fallback={type(self._fallback_router).__name__}, "
+            f"prefix_aware={True}, "
             f"kv_aware={self._kv_router is not None}"
         )
 
@@ -1119,10 +1151,11 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
         request: Request,
         request_json: Optional[Dict] = None,
     ) -> EndpointInfo:
-        """Select decode endpoint using kv-aware routing when configured.
+        """Select decode endpoint using kv-aware, then prefix-aware fallback.
 
         1. Try kv-aware routing when LMCache is configured.
-        2. Fall back to round-robin if no usable kv route is found.
+        2. Try prefix-aware routing if no usable kv route is found.
+        3. Fall back to round-robin if neither finds a good match.
         """
         if not decoder_endpoints:
             raise ValueError("No decode endpoints available")
@@ -1143,6 +1176,23 @@ class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
                 logger.warning(f"KV-aware returned stale decode endpoint: {kv_url}")
             except Exception as e:
                 logger.warning(f"KV-aware routing failed for decode: {e}")
+
+        try:
+            prefix_url = await self._prefix_router.route_request(
+                decoder_endpoints,
+                engine_stats,
+                request_stats,
+                request,
+                request_json,
+            )
+            ctx = getattr(request.state, "prefix_aware_ctx", None)
+            if ctx and ctx.used_prefix_match:
+                for ep in decoder_endpoints:
+                    if ep.url == prefix_url:
+                        logger.info(f"Decode selected via prefix-aware: {prefix_url}")
+                        return ep
+        except Exception as e:
+            logger.warning(f"Prefix-aware routing failed for decode: {e}")
 
         # Fall back to round-robin
         sorted_endpoints = sorted(decoder_endpoints, key=lambda e: e.url)
@@ -1209,6 +1259,8 @@ def initialize_routing_logic(
         router = DisaggregatedPrefillRouter(
             kwargs.get("prefill_model_labels"),
             kwargs.get("decode_model_labels"),
+            prefix_aware_match_threshold=kwargs.get("prefix_aware_match_threshold", 0),
+            prefix_aware_per_model_config=kwargs.get("prefix_aware_per_model_config"),
             tokenizer_model_names=kwargs.get("tokenizer_model_names"),
             lmcache_controller_port=kwargs.get("lmcache_controller_port"),
             kv_aware_threshold=kwargs.get("kv_aware_threshold", 2000),
@@ -1229,6 +1281,8 @@ def initialize_routing_logic(
             kwargs.get("decode_model_labels"),
             fallback_routing_logic=kwargs.get("fallback_routing_logic"),
             session_key=kwargs.get("session_key"),
+            prefix_aware_match_threshold=kwargs.get("prefix_aware_match_threshold", 0),
+            prefix_aware_per_model_config=kwargs.get("prefix_aware_per_model_config"),
             tokenizer_model_names=kwargs.get("tokenizer_model_names"),
             lmcache_controller_port=kwargs.get("lmcache_controller_port"),
             kv_aware_threshold=kwargs.get("kv_aware_threshold", 2000),
