@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 from vllm_router.external_providers.base import ExternalProviderAdapter
 from vllm_router.external_providers.models import ExternalProviderConfig
 from vllm_router.log import init_logger
+from vllm_router.utils import AliasConfig
 
 logger = init_logger(__name__)
 
@@ -70,7 +71,7 @@ class ExternalProviderManager:
         for model in config.models:
             self._register_model_id(model.id, config.name, adapter, model.id)
             for alias in model.aliases:
-                self._register_model_id(alias, config.name, adapter, model.id)
+                self._register_model_id(alias.model, config.name, adapter, model.id)
 
         logger.info(
             f"Registered provider '{config.name}'"
@@ -153,6 +154,19 @@ class ExternalProviderManager:
         if entry is None:
             return None
         return entry[0]
+
+    def get_alias_config(self, model_id: str) -> Optional[AliasConfig]:
+        """
+        Get the external provider alias configuration for a requested alias.
+
+        Returns None for canonical model IDs or unknown models.
+        """
+        entry = self._model_index.get(model_id)
+        if entry is None:
+            return None
+        provider_name, _, _ = entry
+        adapter = self._adapters[provider_name]
+        return adapter.config.resolve_alias_config(model_id)
 
     def get_all_external_model_ids(self) -> list[str]:
         """

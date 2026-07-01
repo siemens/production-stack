@@ -134,6 +134,10 @@ async def process_external_provider_request(
     adapter = registry.lookup_adapter(requested_model)
     provider_name = registry.get_provider_name(requested_model)
     canonical_model_id = registry.get_canonical_model_id(requested_model)
+    alias_config = registry.get_alias_config(requested_model)
+    if alias_config is not None:
+        if alias_config.reasoning_effort and "reasoning_effort" not in request_json:
+            request_json["reasoning_effort"] = alias_config.reasoning_effort
 
     logger.info(
         f"Routing request {request_id} for model '{requested_model}' "

@@ -65,7 +65,11 @@ class OpenAIProvider(ExternalProviderAdapter):
             )
             payload = {**payload, "model": canonical_id}
 
+        # Apply any provider-specific payload adjustments
+        payload = self._transform_payload(payload)
+
         url = self.config.api_base.rstrip("/") + endpoint
+
         logger.info(
             f"OpenAIProvider: sending request to ({url}) (model: {payload.get('model')})"
         )
@@ -95,6 +99,19 @@ class OpenAIProvider(ExternalProviderAdapter):
             f"OpenAIProvider: all {self.config.max_retries} retry attempts failed. Last error: {last_error}"
         )
         raise last_error
+
+    def _transform_payload(self, payload: dict) -> dict:
+        """Apply provider-specific payload adjustments before forwarding.
+
+        Azure AI Foundry disables reasoning via ``reasoning_effort`` set to the
+        literal string ``"None"`` (capitalized). Our normalized alias config
+        uses lowercase ``"none"``, so translate it here so reasoning is actually
+        disabled on the provider side.
+        See https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning
+        """
+        if payload.get("reasoning_effort") == "none":
+            payload = {**payload, "reasoning_effort": "None"}
+        return payload
 
     async def _send_standard_request(
         self, session: aiohttp.ClientSession, url: str, headers: dict, payload: dict

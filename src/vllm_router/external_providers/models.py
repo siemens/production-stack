@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from vllm_router.log import init_logger
+from vllm_router.utils import AliasConfig
 
 logger = init_logger(__name__)
 
@@ -13,7 +14,40 @@ class ExternalModelConfig:
 
     id: str
     type: str = "chat"
-    aliases: list[str] = field(default_factory=list)
+    aliases: list[AliasConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.aliases = [self._normalize_alias(alias) for alias in self.aliases]
+
+    @staticmethod
+    def _normalize_alias(alias: object) -> AliasConfig:
+        if isinstance(alias, AliasConfig):
+            return alias
+        if isinstance(alias, str):
+            return AliasConfig(model=alias)
+        if isinstance(alias, dict):
+            unknown_keys = set(alias) - {"name", "reasoning_effort"}
+            if unknown_keys:
+                raise ValueError(
+                    "Invalid external model alias: unknown keys "
+                    f"{sorted(unknown_keys)}. Supported keys: name, reasoning_effort"
+                )
+            name = alias.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "Invalid external model alias: missing required key 'name'"
+                )
+            return AliasConfig(
+                model=name,
+                reasoning_effort=alias.get("reasoning_effort"),
+            )
+        raise TypeError(
+            "Invalid external model alias: expected string or dict, "
+            f"got {type(alias).__name__}"
+        )
+
+    def alias_names(self) -> list[str]:
+        return [alias.model for alias in self.aliases]
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "ExternalModelConfig":
@@ -59,14 +93,22 @@ class ExternalProviderConfig:
         model_ids = []
         for model in self.models:
             model_ids.append(model.id)
-            model_ids.extend(model.aliases)
+            model_ids.extend(model.alias_names())
         return model_ids
 
     def resolve_model_id(self, requested_model: str) -> Optional[str]:
         """Resolve a requested model name to a valid model ID for this provider."""
         for model in self.models:
-            if requested_model == model.id or requested_model in model.aliases:
+            if requested_model == model.id or requested_model in model.alias_names():
                 return model.id
+        return None
+
+    def resolve_alias_config(self, requested_model: str) -> Optional[AliasConfig]:
+        """Resolve a requested alias to its optional request overrides."""
+        for model in self.models:
+            for alias in model.aliases:
+                if requested_model == alias.model:
+                    return alias
         return None
 
     @staticmethod
