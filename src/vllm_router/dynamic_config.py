@@ -58,6 +58,7 @@ class DynamicRouterConfig:
     static_model_labels: Optional[str] = None
     static_model_types: Optional[str] = None
     static_healthcheck_disabled: Optional[str] = None
+    static_endpoint_prefixes: Optional[str] = None
     static_backend_health_checks: Optional[bool] = False
     static_backend_health_check_interval: Optional[int] = 60
     static_backend_health_check_timeout_seconds: Optional[int] = 10
